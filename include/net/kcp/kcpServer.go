@@ -15,19 +15,18 @@ type KCPEvent interface {
 	OnSend(handle uint64, remoteIp string, remotePort int, size int)
 	OnRead(handle uint64, remoteIp string, remotePort int, data []byte, size int) bool
 	OnDisconnect(handle uint64, remoteIp string, remotePort int)
-	OnError(handle uint64, remoteIp string, remotePort int)
+	OnError(handle uint64, remoteIp string, remotePort int, err error)
 }
 
 type KCPServer struct {
-	lock      sync.Mutex
-	linkers   map[uint64]*Linker
-	curHandle uint64
-	localIp   string
-	localPort int
-	event     KCPEvent
+	lock          sync.Mutex
+	linkers       map[uint64]*Linker
+	curHandle     uint64
+	localIp       string
+	localPort     int
+	event         KCPEvent
+	timeOutSecond int64
 }
-
-var gKCPServer *KCPServer
 
 func (k *KCPServer) CreateHandler() uint64 {
 	for {
@@ -116,7 +115,7 @@ func (k *KCPServer) acceptKCP(listener *kcp.Listener) {
 		log4plus.Info("%s New Connection remoteIp=[%s] remotePort=[%d]---->>>>", funName, remoteIp, remotePort)
 		handle := k.CreateHandler()
 		linker := NewLinker(handle, remoteIp, remotePort, conn)
-		linker.Init(gKCPServer)
+		linker.Init(k)
 	}
 }
 
@@ -142,41 +141,63 @@ func (k *KCPServer) Start(listen string) error {
 	return nil
 }
 
-func (k *KCPServer) Init(event KCPEvent) error {
-	funName := "Init"
-	if nil == gKCPClient {
-		errString := fmt.Sprintf("%s Init Failed Object is nil", funName)
-		log4plus.Error(errString)
-		return errors.New(errString)
+func (k *KCPServer) Init(event KCPEvent) {
+	k.event = event
+	go k.timeOut()
+}
+
+func (k *KCPServer) timeOut() {
+	funName := "timeOut"
+	for {
+		time.Sleep(time.Duration(5) * time.Second)
+		now := time.Now().Add(time.Duration(-1*k.timeOutSecond) * time.Second)
+		for _, linker := range k.linkers {
+			if now.Sub(linker.Heartbeat()) > 0 {
+				log4plus.Info("%s linker Object timeOut handle=[%d] remoteIp=[%s] remotePort=[%d] ---->>>>", funName, linker.Handle(), linker.Ip(), linker.Port())
+				k.lock.Lock()
+				defer k.lock.Unlock()
+				_ = linker.conn.Close()
+				if k.event != nil {
+					k.event.OnDisconnect(linker.Handle(), linker.Ip(), linker.Port())
+				}
+				delete(k.linkers, linker.Handle())
+			}
+		}
 	}
-	gKCPClient.event = event
-	return nil
 }
 
 func (k *KCPServer) OnSend(handle uint64, remoteIp string, remotePort int, size int) {
-	k.event.OnSend(handle, remoteIp, remotePort, size)
+	if k.event != nil {
+		k.event.OnSend(handle, remoteIp, remotePort, size)
+	}
 }
 
 func (k *KCPServer) OnRead(handle uint64, remoteIp string, remotePort int, data []byte, size int) bool {
-	return k.event.OnRead(handle, remoteIp, remotePort, data, size)
+	if k.event != nil {
+		return k.event.OnRead(handle, remoteIp, remotePort, data, size)
+	}
+	return true
 }
 
 func (k *KCPServer) OnDisconnect(handle uint64, remoteIp string, remotePort int) {
-	k.event.OnDisconnect(handle, remoteIp, remotePort)
+	if k.event != nil {
+		k.event.OnDisconnect(handle, remoteIp, remotePort)
+	}
 }
 
-func (k *KCPServer) OnError(handle uint64, remoteIp string, remotePort int) {
-	k.event.OnError(handle, remoteIp, remotePort)
+func (k *KCPServer) OnError(handle uint64, remoteIp string, remotePort int, err error) {
+	if k.event != nil {
+		k.event.OnError(handle, remoteIp, remotePort, err)
+	}
 }
 
-func SingtonKCPServer() *KCPServer {
-	if nil == gKCPServer {
-		gKCPServer = &KCPServer{
-			curHandle: 1000,
-			localIp:   "",
-			localPort: -1,
-			linkers:   make(map[uint64]*Linker),
-		}
+func NewKCPServer() *KCPServer {
+	gKCPServer := &KCPServer{
+		timeOutSecond: 15,
+		curHandle:     1000,
+		localIp:       "",
+		localPort:     -1,
+		linkers:       make(map[uint64]*Linker),
 	}
 	return gKCPServer
 }
