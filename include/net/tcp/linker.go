@@ -1,19 +1,12 @@
 package tcp
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	log4plus "github.com/include/log4go"
 	"net"
 	"time"
-	"unsafe"
-)
-
-type PacketMode uint8
-
-const (
-	HeartBeat PacketMode = iota
-	Message
 )
 
 type ServerMode uint8
@@ -23,9 +16,16 @@ const (
 	Client
 )
 
+type PacketMode uint8
+
+const (
+	HeartBeat PacketMode = iota
+	Message
+)
+
 type Packet struct {
 	Mode PacketMode
-	Size int
+	Size int32
 }
 
 type Linker struct {
@@ -35,14 +35,15 @@ type Linker struct {
 	handle      uint64
 	conn        net.Conn
 	event       TCPEvent
-	recvSize    uint64
-	sendSize    uint64
+	recvSize    int32
+	sendSize    int32
 	heartbeat   time.Time
 	recvChan    chan []byte
 	sendChan    chan []byte
 	closeChan   chan error
 	spareBuffer []byte
-	spareSize   int
+	spareSize   int32
+	headerSize  int32
 }
 
 func (l *Linker) Handle() uint64 {
@@ -57,11 +58,11 @@ func (l *Linker) Port() int {
 	return l.remotePort
 }
 
-func (l *Linker) SendSize() uint64 {
+func (l *Linker) SendSize() int32 {
 	return l.sendSize
 }
 
-func (l *Linker) RecvSize() uint64 {
+func (l *Linker) RecvSize() int32 {
 	return l.recvSize
 }
 
@@ -69,18 +70,18 @@ func (l *Linker) Heartbeat() time.Time {
 	return l.heartbeat
 }
 
-func (l *Linker) assemblyPacket(data []byte) []byte {
+func (l *Linker) assemblyPacket(mode PacketMode, data []byte) []byte {
 	packet := Packet{
-		Mode: Message,
-		Size: len(data),
+		Mode: mode,
+		Size: int32(len(data)),
 	}
-	buffer, _ := json.Marshal(packet)
+	buffer, _ := l.serializePacket(packet)
 	buffer = append(buffer, data...)
 	return buffer
 }
 
 func (l *Linker) Send(data []byte) (error, int) {
-	l.sendChan <- l.assemblyPacket(data)
+	l.sendChan <- l.assemblyPacket(Message, data)
 	return nil, len(data)
 }
 
@@ -106,7 +107,9 @@ func (l *Linker) Recv() {
 
 func (l *Linker) heartbeatMsg(data []byte) {
 	l.heartbeat = time.Now()
-	l.sendChan <- data
+	if l.serverMode == Server {
+		l.sendChan <- data
+	}
 }
 
 func (l *Linker) dataMsg(data []byte) {
@@ -117,22 +120,64 @@ func (l *Linker) dataMsg(data []byte) {
 		}
 	}
 	l.heartbeat = time.Now()
-	l.recvSize += uint64(len(data))
+	l.recvSize += int32(len(data))
+}
+
+// Serialize to binary
+func (l *Linker) getHeaderSize() int32 {
+	packet := Packet{
+		Mode: HeartBeat,
+		Size: 1024,
+	}
+	buf := new(bytes.Buffer)
+	_ = binary.Write(buf, binary.LittleEndian, packet.Mode)
+	_ = binary.Write(buf, binary.LittleEndian, packet.Size)
+	return int32(buf.Len())
+}
+
+// Serialize to binary
+func (l *Linker) serializePacket(p Packet) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.BigEndian, p.Mode); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, int32(p.Size)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Deserialize from binary
+func (l *Linker) deserializePacket(data []byte) (Packet, error) {
+	buf := bytes.NewReader(data)
+	var p Packet
+	if err := binary.Read(buf, binary.BigEndian, &p.Mode); err != nil {
+		return Packet{}, err
+	}
+	var size int32
+	if err := binary.Read(buf, binary.BigEndian, &size); err != nil {
+		return Packet{}, err
+	}
+	p.Size = size
+	return p, nil
 }
 
 func (l *Linker) parseData(data []byte) {
-	l.spareSize += len(data)
+	l.spareSize += int32(len(data))
 	l.spareBuffer = append(l.spareBuffer, data...)
 	for {
+		//check spareSize
+		if l.spareSize <= 0 {
+			break
+		}
 		//Get packet header
-		header := Packet{}
-		headerSize := unsafe.Sizeof(header)
-		if l.spareSize < int(headerSize) {
+		if l.spareSize < l.headerSize {
 			return
 		}
 		//Parse packet header
-		headerBuffer := l.spareBuffer[:headerSize]
-		if err := json.Unmarshal(headerBuffer, &header); err != nil {
+		headerBuffer := l.spareBuffer[:l.headerSize]
+		header, err := l.deserializePacket(headerBuffer)
+		if err != nil {
 			l.closeChan <- err
 			return
 		}
@@ -141,20 +186,24 @@ func (l *Linker) parseData(data []byte) {
 			//heartbeat
 			l.heartbeatMsg(headerBuffer)
 			//Reduce buffer data length
-			l.spareSize -= int(headerSize)
+			l.spareSize -= l.headerSize
 			//Move buffer
-			copy(l.spareBuffer, l.spareBuffer[int(headerSize):])
+			copy(l.spareBuffer, l.spareBuffer[l.headerSize:])
+			//clear slice
+			l.spareBuffer = l.spareBuffer[:l.spareSize]
 		} else if header.Mode == Message {
 			//message
-			if l.spareSize < header.Size+int(headerSize) {
+			if l.spareSize < header.Size+l.headerSize {
 				return
 			}
-			messageBuffer := l.spareBuffer[int(headerSize) : int(headerSize)+header.Size]
+			messageBuffer := l.spareBuffer[l.headerSize : l.headerSize+header.Size]
 			l.dataMsg(messageBuffer)
 			//Reduce buffer data length
-			l.spareSize = l.spareSize - (int(headerSize) + header.Size)
-			//Move buffer
-			copy(l.spareBuffer, l.spareBuffer[int(headerSize)+header.Size:])
+			l.spareSize = l.spareSize - (l.headerSize + header.Size)
+			//Move buffer copy(A, A[start:end])
+			copy(l.spareBuffer, l.spareBuffer[l.headerSize+header.Size:])
+			//clear slice A = A[:end-start]
+			l.spareBuffer = l.spareBuffer[:l.spareSize]
 		}
 	}
 }
@@ -171,7 +220,7 @@ func (l *Linker) sendBuffer(data []byte) {
 	if l.event != nil {
 		l.event.OnSend(l.handle, l.remoteIp, l.remotePort, nRet)
 	}
-	l.sendSize += uint64(nRet)
+	l.sendSize += int32(nRet)
 }
 
 func (l *Linker) linkerClose(err error) {
@@ -198,7 +247,7 @@ func (l *Linker) waitData() {
 func (l *Linker) sendHeartbeat() {
 	for {
 		time.Sleep(time.Duration(5) * time.Second)
-		l.sendChan <- l.assemblyPacket([]byte(""))
+		l.sendChan <- l.assemblyPacket(HeartBeat, []byte(""))
 	}
 }
 
@@ -226,6 +275,8 @@ func NewLinker(handle uint64, remoteIp string, remotePort int, conn net.Conn, mo
 		sendChan:   make(chan []byte, 1024),
 		closeChan:  make(chan error),
 	}
-	log4plus.Info("%s handle=[%d] remoteIp=[%s] remotePort=[%d]", funName, linker.handle, linker.remoteIp, linker.remotePort)
+	linker.headerSize = linker.getHeaderSize()
+	log4plus.Info("%s handle=[%d] remoteIp=[%s] remotePort=[%d] headerSize=[%d]",
+		funName, linker.handle, linker.remoteIp, linker.remotePort, linker.headerSize)
 	return linker
 }
