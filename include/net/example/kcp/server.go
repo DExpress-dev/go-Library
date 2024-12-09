@@ -1,13 +1,13 @@
-package tcp
+package kcp
 
 import (
 	"fmt"
 	log4plus "github.com/include/log4go"
-	"github.com/nGPU/include/net/tcp"
+	"github.com/nGPU/include/net/kcp"
 )
 
 type Server struct {
-	tcpServer *tcp.TCPServer
+	kcpServer *kcp.KCPServer
 }
 
 func (k *Server) OnSend(handle uint64, remoteIp string, remotePort int, size int) {
@@ -28,14 +28,14 @@ func (k *Server) OnError(handle uint64, remoteIp string, remotePort int, err err
 }
 
 func (k *Server) Start() bool {
-	k.tcpServer = tcp.NewTCPServer()
-	if k.tcpServer == nil {
+	k.kcpServer = kcp.NewKCPServer()
+	if k.kcpServer == nil {
 		errString := fmt.Sprintf("NewTCPServer Failed ")
 		log4plus.Error(errString)
 		return false
 	}
-	k.tcpServer.Init(k)
-	if err := k.tcpServer.Start(":41002"); err != nil {
+	k.kcpServer.Init(k)
+	if err := k.kcpServer.Start(":41002"); err != nil {
 		log4plus.Error("Start Failed err=[%s]", err.Error())
 		return false
 	}
